@@ -46,9 +46,30 @@ For the portable controllers, start with a read-only configuration:
 {"schema": "wsorb.stp_official", "schema_version": 1, "enabled": false, "probe": true}
 ```
 
+An enabled WSO example:
+
+```json
+{
+  "schema": "wsorb.stp_policy",
+  "schema_version": 1,
+  "enabled": true,
+  "radar_clock_offset_s": 0.0,
+  "policy": "checkpoint_velocity",
+  "checkpoint_radius_m": 50.0,
+  "body_axis_preference": false,
+  "max_speed_mps": 8.0,
+  "duration_wall_s": 600.0,
+  "tracking_diagnostics": true
+}
+```
+
+Set `radar_clock_offset_s` from the runtime's clock origins. Zero is valid only
+when the operator independently knows the origins coincide. Ali's enabled
+document uses the same `enabled` and `radar_clock_offset_s` pattern with schema
+`wsorb.stp_official` and the fields in `STPOfficialConfig`.
+
 An enabled run needs an independently established `radar_clock_offset_s`, a
-reviewed checkpoint radius and sole command ownership. The configuration
-reference lives in `STPPolicyConfig` and `STPOfficialConfig`.
+reviewed checkpoint radius and sole command ownership.
 
 This repository contains source only. It does not include a licensed-runtime
 result, and no candidate should be described as an official STP score until it

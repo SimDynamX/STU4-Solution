@@ -89,3 +89,7 @@ TAGS
 
 # VSCode's meta files
 **/.vscode/**
+
+# Local controller output
+controller_log.txt
+cam_*.png

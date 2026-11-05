@@ -66,7 +66,6 @@ def SetCommand(accelCommand: npt.NDArray, angAccelCommand: npt.NDArray) -> None:
 
 import copy
 from PIL import Image
-from radar_display import RadarDisplay
 
 ###############################
 # Get initial simulation time #
@@ -210,7 +209,7 @@ def two_sideways_directions(direction):
 
 
 class Avoider:
-    def __init__(self, margin=6.0, unknown_extra=4.0, horizon=15.0):
+    def __init__(self, margin=6.0, unknown_extra=4.0, horizon=50.0):
         self.margin = margin                # metres of clearance beyond each rock's surface
         self.unknown_extra = unknown_extra  # extra margin for rocks whose velocity we don't know yet
         self.horizon = horizon

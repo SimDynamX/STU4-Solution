@@ -1,29 +1,18 @@
-# Keep imports after the SDK bootstrap and example setup in their original order.
-# ruff: noqa: E402
-
 #############################################################################################
 # DON'T CHANGE ANY OF THE BELOW. NECESSARY FOR CORRECTLY JOINING THE COMPETITION SIMULATION #
 #############################################################################################
 
-import datetime
-import os
-import sys
-import time
-import traceback
-
+import os, sys, time, datetime, traceback
 import spaceteams as st
-
-
 def custom_exception_handler(exctype, value, tb):
     error_message = "".join(traceback.format_exception(exctype, value, tb))
     st.logger_fatal(error_message)
-
-
 sys.excepthook = custom_exception_handler
 st.connect_to_sim(sys.argv)
 
 import numpy as np
 import numpy.typing as npt
+
 
 this = st.GetThisSystem()
 
@@ -45,10 +34,9 @@ bottomCameraFrame = bottomCamera.GetBodyFixedFrame()
 
 
 def GetNearestDebrisLocations(N: int) -> list[npt.NDArray]:
-    allDebrisInfo: list[npt.NDArray] = shuttle.GetParamArray(
-        st.VarType.doubleM3x3, ["Radar", "SortedDebrisData"]
-    )
-    nearest = allDebrisInfo[: min(N, len(allDebrisInfo))]
+    allDebrisInfo: list[npt.NDArray] = shuttle.GetParamArray(st.VarType.doubleM3x3, 
+                                                            ["Radar", "SortedDebrisData"])
+    nearest = allDebrisInfo[:min(N, len(allDebrisInfo))]
     return nearest
 
 
@@ -59,9 +47,7 @@ def PanTiltCamera(camera: st.Entity, yaw_deg: float, pitch_deg: float) -> None:
     elif camera == bottomCamera:
         yaw_deg = np.clip(yaw_deg, -89.0, 89.0)
         pitch_deg = np.clip(pitch_deg, 0.0, 50.0)
-    camera.setRotation_DCM(
-        st.math.Euler321_to_DCM([np.deg2rad(yaw_deg), np.deg2rad(pitch_deg), 0.0]), shuttleFrame
-    )
+    camera.setRotation_DCM(st.math.Euler321_to_DCM([np.deg2rad(yaw_deg), np.deg2rad(pitch_deg), 0.0]), shuttleFrame)
 
 
 def SetCommand(accelCommand: npt.NDArray, angAccelCommand: npt.NDArray) -> None:
@@ -78,9 +64,7 @@ def SetCommand(accelCommand: npt.NDArray, angAccelCommand: npt.NDArray) -> None:
 # EXAMPLE USER CODE (NOTE: RUNNING A LOOP IS NECESSARY) #
 #########################################################
 
-
 import copy
-
 from PIL import Image
 from radar_display import RadarDisplay
 
@@ -88,103 +72,283 @@ from radar_display import RadarDisplay
 # Get initial simulation time #
 ###############################
 
-t0_sim: st.timestamp = st.SimGlobals.GetSimEntity().GetParam(
-    st.VarType.timestamp, ["Time", "StartDateTAI"]
-)
+t0_sim: st.timestamp = st.SimGlobals.GetSimEntity().GetParam(st.VarType.timestamp, ["Time", "StartDateTAI"])
 t0: datetime.datetime = t0_sim.as_datetime()
 
 ###################
 # Make a log file #
 ###################
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "controller_log.txt")
-# Keep the existing log open for the process lifetime; line-buffered, fresh each run.
-log_file = open(LOG_PATH, "w", buffering=1)  # noqa: SIM115
-
+log_file = open(LOG_PATH, "w", buffering=1)   # line-buffered, fresh file each run
 
 def status(msg: str, key: str = "Status") -> None:
     print(msg, flush=True)
     st.OnScreenLogMessage(msg, key, st.Severity.Info)
     log_file.write(msg + "\n")
 
-
 """
 Get angular velocity from two quaternions representing the orientation of 
 an object at time (t0) and (t0 + dt). Assumes scalar-last quaternions.
 """
-
-
 def AngVelFromQuats(q1: npt.NDArray, q2: npt.NDArray, dt: float):
-    return (2.0 / dt) * np.array(
-        [
-            q1[3] * q2[0] - q1[0] * q2[3] - q1[1] * q2[2] + q1[2] * q2[1],
-            q1[3] * q2[1] + q1[0] * q2[2] - q1[1] * q2[3] - q1[2] * q2[0],
-            q1[3] * q2[2] - q1[0] * q2[1] + q1[1] * q2[0] - q1[2] * q2[3],
-        ]
-    )
+    return (2.0 / dt) * np.array([
+        q1[3]*q2[0] - q1[0]*q2[3] - q1[1]*q2[2] + q1[2]*q2[1],
+        q1[3]*q2[1] + q1[0]*q2[2] - q1[1]*q2[3] - q1[2]*q2[0],
+        q1[3]*q2[2] - q1[0]*q2[1] + q1[1]*q2[0] - q1[2]*q2[3]])
+
+####################################
+# Classes and Function Definitions # 
+####################################
+
+"""
+Conventions used everywhere:
+  * Positions and velocities are in the Phobos frame, in metres and metres/second.
+  * "Radar item" = one 3x3 array from GetNearestDebrisLocations():
+        item[0, :]  rock centre RELATIVE to the shuttle (m)
+        item[1, 0]  distance to its surface     item[1, 1]  range rate (m/s)
+        item[1, 2]  diameter (m)                item[2, 0]  time of measurement (s since sim start)
+"""
+
+import numpy as np
+from collections import deque
+
+# =====================================================================================
+# 1. TRACKING - the radar forgets everything between readings, so we keep a list of rocks
+# =====================================================================================
+
+class Rock:
+    def __init__(self, position, diameter, time):
+        self.position = position          # latest ABSOLUTE position
+        self.diameter = diameter
+        self.velocity = None              # unknown until we have watched it for a while
+        self.last_seen = time
+        self.history = deque(maxlen=30)   # recent (time, position) samples; capped so memory can't grow
+        self.history.append((time, position))
+
+    def add_sighting(self, position, diameter, time):
+        if time <= self.last_seen:        # the radar repeated an old reading: ignore it
+            return
+        self.position = position
+        self.diameter = 0.8 * self.diameter + 0.2 * diameter     # smooth the noisy diameter
+        self.last_seen = time
+        self.history.append((time, position))
+        self.update_velocity()
+
+    def update_velocity(self):
+        times = np.array([t for t, p in self.history])
+        points = np.array([p for t, p in self.history])
+        if len(times) < 3 or times[-1] - times[0] < 1.0:
+            return                        # too little data: a velocity now would be mostly noise
+        # Fit a straight line through the positions. Its slope (per axis) is the velocity.
+        self.velocity = np.polyfit(times - times[0], points, 1)[0]
+
+    def predicted_position(self, time):
+        if self.velocity is None:
+            return self.position
+        return self.position + self.velocity * (time - self.last_seen)
 
 
-def fib_sphere(n):
-    i = np.arange(n) + 0.5
-    phi = np.arccos(1 - 2 * i / n)
-    th = np.pi * (1 + 5**0.5) * i
-    return np.stack([np.cos(th) * np.sin(phi), np.sin(th) * np.sin(phi), np.cos(phi)], 1)
+class Tracker:
+    def __init__(self, gate=15.0, max_age=5.0):
+        self.rocks = []
+        self.gate = gate          # sightings closer than this (m) count as the same rock
+        self.max_age = max_age    # forget rocks not seen for this long (s)
+
+    def update(self, radar_items, shuttle_position, now):
+        for item in radar_items:
+            # The radar gives positions relative to the shuttle. Add the shuttle's own
+            # position so that all sightings share one fixed frame.
+            position = shuttle_position + item[0, :]
+            diameter, time = item[1, 2], item[2, 0]
+            rock = self.find_match(position, diameter, time)
+            if rock is None:
+                self.rocks.append(Rock(position, diameter, time))    # new rock
+            else:
+                rock.add_sighting(position, diameter, time)
+        self.rocks = [r for r in self.rocks if now - r.last_seen < self.max_age]
+
+    def find_match(self, position, diameter, time):
+        """The closest existing rock that is a similar size and within the gate, else None."""
+        best, best_distance = None, self.gate
+        for rock in self.rocks:
+            if abs(rock.diameter - diameter) > 0.25 * rock.diameter:
+                continue                                              # sizes too different
+            distance = np.linalg.norm(rock.predicted_position(time) - position)
+            if distance < best_distance:
+                best, best_distance = rock, distance
+        return best
 
 
-DIRS = fib_sphere(400)
+# =====================================================================================
+# 2. AVOIDANCE - choose the velocity to fly
+# =====================================================================================
+
+def clearance(my_velocity, rel_pos, rock_vel, keep_out, horizon=15.0):
+    """
+    If we fly at my_velocity, how close do we get to the worst rock in the next `horizon` seconds,
+    after subtracting its keep-out radius? Positive = safe, negative = collision course.
+      rel_pos  (n,3)  where each rock is, relative to us
+      rock_vel (n,3)  how fast each rock is moving
+      keep_out (n,)   radius we want to stay outside (rock radius + safety margin)
+    """
+    rel_vel = rock_vel - my_velocity                       # how each rock moves as seen from us
+    speed_squared = (rel_vel ** 2).sum(axis=1) + 1e-9
+    # time when the rock is closest to us (from minimising |rel_pos + t * rel_vel|)
+    t = -(rel_pos * rel_vel).sum(axis=1) / speed_squared
+    t = np.clip(t, 0.0, horizon)                           # only look from now until the horizon
+    closest = np.linalg.norm(rel_pos + t[:, None] * rel_vel, axis=1)
+    return (closest - keep_out).min()
 
 
-def pick_safe_velocity(v_des, debris_info, margin=8.0, horizon=15.0):
-    speed = np.linalg.norm(v_des)
-    if speed < 1e-3 or len(debris_info) == 0:
-        return v_des
-    P = np.array([d[0, :] for d in debris_info])  # relative to shuttle
-    R = np.array([d[1, 2] / 2 for d in debris_info]) + margin  # inflated radii
-    order = np.argsort(-(DIRS @ (v_des / speed)))  # best-aligned first
-    for scale in (1.0, 0.5, 0.25):  # then try slower
-        V = DIRS[order] * speed * scale
-        t = np.clip((P @ V.T) / (speed * scale) ** 2, 0, horizon)
-        closest = np.linalg.norm(P[:, None, :] - t[:, :, None] * V[None], axis=2)
-        safe = np.all(closest > R[:, None], axis=0)
-        if safe.any():
-            return V[np.argmax(safe)]
-    return np.zeros(3)  # nowhere safe: stop
+def two_sideways_directions(direction):
+    """Two unit vectors that are perpendicular to `direction` and to each other."""
+    helper = np.array([0.0, 0.0, 1.0]) if abs(direction[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    side1 = np.cross(direction, helper)
+    side1 /= np.linalg.norm(side1)
+    side2 = np.cross(direction, side1)
+    return side1, side2
 
+
+class Avoider:
+    def __init__(self, margin=6.0, unknown_extra=4.0, horizon=15.0):
+        self.margin = margin                # metres of clearance beyond each rock's surface
+        self.unknown_extra = unknown_extra  # extra margin for rocks whose velocity we don't know yet
+        self.horizon = horizon
+        self.last_dodge = None              # remembered so we don't flip-flop between dodges
+
+    def choose(self, wanted_velocity, rocks, shuttle_position, now):
+        """Return the velocity to fly: the wanted one if it is safe, else the smallest safe change."""
+        wanted_velocity = np.asarray(wanted_velocity, float)
+        speed = np.linalg.norm(wanted_velocity)
+        if speed < 1e-3 or len(rocks) == 0:
+            return wanted_velocity
+
+        # Describe every rock as plain arrays.
+        rel_pos = np.array([r.predicted_position(now) - shuttle_position for r in rocks])
+        rock_vel = np.array([r.velocity if r.velocity is not None else np.zeros(3) for r in rocks])
+        keep_out = np.array([r.diameter / 2 + self.margin
+                             + (self.unknown_extra if r.velocity is None else 0.0) for r in rocks])
+
+        def score(velocity):
+            return clearance(velocity, rel_pos, rock_vel, keep_out, self.horizon)
+
+        # 1. Nothing in the way? Fly exactly as wanted (no thruster use at all).
+        if score(wanted_velocity) > 0:
+            self.last_dodge = None
+            return wanted_velocity
+
+        # 2. Still dodging? Keep the same dodge while it still works (stops flip-flopping).
+        if self.last_dodge is not None and score(self.last_dodge) > 0:
+            return self.last_dodge
+
+        # 3. Try sideways dodges, SMALLEST first: a small velocity change costs the least fuel.
+        side1, side2 = two_sideways_directions(wanted_velocity / speed)
+        tried = [wanted_velocity]
+        for size in (0.05, 0.1, 0.2, 0.35, 0.5, 0.75):         # as a fraction of our speed
+            for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+                sideways = np.cos(angle) * side1 + np.sin(angle) * side2
+                candidate = wanted_velocity + size * speed * sideways
+                if score(candidate) > 0:
+                    self.last_dodge = candidate
+                    return candidate
+                tried.append(candidate)
+
+        # 4. No sideways dodge works: try slowing down.
+        for fraction in (0.5, 0.25, 0.0):
+            candidate = wanted_velocity * fraction
+            if score(candidate) > 0:
+                self.last_dodge = candidate
+                return candidate
+            tried.append(candidate)
+
+        # 5. Nothing is fully safe: take the least-bad option we looked at.
+        self.last_dodge = max(tried, key=score)
+        return self.last_dodge
+
+# =====================================================================================
+# 3. FUEL - only fire the thrusters when the velocity error is worth a burn
+# =====================================================================================
+
+class BurnGovernor:
+    def __init__(self, gain=5.0, start=0.3, stop=0.1):
+        self.gain = gain        # acceleration (m/s^2) per m/s of velocity error
+        self.start = start      # start burning when the error is bigger than this (m/s)
+        self.stop = stop        # stop burning once the error is smaller than this (m/s)
+        self.burning = False
+
+    def acceleration(self, wanted_velocity, current_velocity):
+        error = np.asarray(wanted_velocity, float) - np.asarray(current_velocity, float)
+        size = np.linalg.norm(error)
+        if self.burning and size < self.stop:
+            self.burning = False
+        elif not self.burning and size > self.start:
+            self.burning = True
+        return self.gain * error if self.burning else np.zeros(3)
+
+
+# =====================================================================================
+# 4. GOAL - the target is a SPHERE, so we only steer when our path would miss it
+# =====================================================================================
+
+class GoalPlanner:
+    """
+    Decides the velocity we WANT (before avoidance). Instead of constantly steering at the exact
+    centre of the target, it lets us coast while our current path already passes well inside the
+    goal sphere, and only steers when the path drifts towards the edge. Less steering = less fuel.
+    """
+
+    def __init__(self, cruise_speed, goal_radius=10.0, start_fraction=0.7, stop_fraction=0.3):
+        self.cruise_speed = cruise_speed
+        self.goal_radius = goal_radius
+        self.start = start_fraction * goal_radius   # start steering if we would miss the centre by more than this
+        self.stop = stop_fraction * goal_radius     # ...and keep steering until the miss is under this
+        self.correcting = True
+
+    def miss_distance(self, shuttle_position, shuttle_velocity, target_position):
+        """How far from the target centre we would pass if we kept our current velocity."""
+        speed = np.linalg.norm(shuttle_velocity)
+        if speed < 0.98 * self.cruise_speed:
+            return np.inf                                   # not at cruise speed yet: keep accelerating
+        heading = shuttle_velocity / speed
+        to_target = target_position - shuttle_position
+        along = to_target @ heading                         # how far ahead the target is along our heading
+        if along <= 0:
+            return np.inf                                   # we are moving away from it
+        return np.linalg.norm(to_target - along * heading)  # sideways distance at closest approach
+
+    def wanted_velocity(self, shuttle_position, shuttle_velocity, target_position):
+        miss = self.miss_distance(shuttle_position, shuttle_velocity, target_position)
+        if self.correcting and miss < self.stop:
+            self.correcting = False                         # on a good path: coast
+        elif not self.correcting and miss > self.start:
+            self.correcting = True                          # drifting off: steer again
+        if not self.correcting:
+            return np.asarray(shuttle_velocity, float)      # wanting what we have = no thruster use
+        to_target = target_position - shuttle_position
+        return self.cruise_speed * to_target / np.linalg.norm(to_target)
+
+
+####################################
+#        Main Code Start           # 
+####################################
+
+tracker  = Tracker()             
+avoider  = Avoider()
+governor = BurnGovernor(gain=500000.0)
 
 ##################
 # Start the loop #
 ##################
-radar_view = RadarDisplay(view_range_m=50, update_every=1)
-
-
-def to_body(v):
-    return np.asarray(
-        st.frames.FramedVector(np.asarray(v, dtype=float), phobosFrame).ExprIn(shuttleFrame),
-        dtype=float,
-    )
-
-
-###################
-# Debris Tracking #
-###################
-past_positions = []
-
-from debris_tracker import DebrisTracker
-
-tracker = DebrisTracker()
-from avoidance import Avoider, BurnGovernor
-
-avoider = Avoider()
-governor = BurnGovernor(gain=2.0)
-
 
 iteration = 0
 imageNumber = 0
 exit_flag: bool = False
 while not exit_flag:
+
     ################################
     # Wait between loop iterations #
     ################################
-
+    
     time.sleep(1.0 / this.GetParam(st.VarType.double, "LoopFreqHz"))
 
     ###################################
@@ -213,208 +377,36 @@ while not exit_flag:
     damage: float = shuttle.GetParam(st.VarType.double, ["Stats", "Damage"])
     fuelUsed: float = shuttle.GetParam(st.VarType.double, ["Stats", "FuelUsed"])
 
-    ##################################################################
-    # Example for rotating the top camera 30 deg left and 10 deg up, #
-    # and the bottom camera 20 deg right and 15 deg down.            #
-    ##################################################################
+    ##########################################
+    # Get the target's location and velocity #
+    ##########################################
 
-    if iteration % 20 == 0:
-        PanTiltCamera(topCamera, 30.0, -10.0)
-        PanTiltCamera(bottomCamera, -20.0, 15.0)
-
-    ####################################################################################
-    # Example for obtaining an image from the top camera with FOV = 60 deg and EV = 12 #
-    ####################################################################################
-
-    if iteration % 20 == 0:  # Don't hot-loop the image captures
-        cameraParams = st.CaptureImageProperties()
-        cameraParams.nonphys_EV = 10.0
-        cameraParams.FOV = 60.0
-        cameraParams.ResolutionX = 512
-        cameraParams.ResolutionY = 512
-        image = st.camera.CaptureImageBlocking(topCamera, cameraParams)
-
-        if image is not None:
-            imageR = np.asarray(image.as_RGB8().PixelsR).reshape(
-                (cameraParams.ResolutionX, cameraParams.ResolutionY)
-            )
-            imageG = np.asarray(image.as_RGB8().PixelsG).reshape(
-                (cameraParams.ResolutionX, cameraParams.ResolutionY)
-            )
-            imageB = np.asarray(image.as_RGB8().PixelsB).reshape(
-                (cameraParams.ResolutionX, cameraParams.ResolutionY)
-            )
-            imageRGB = Image.fromarray(np.dstack((imageR, imageG, imageB)).astype(np.uint8))
-
-            imageNumber += 1
-            from camera_overlay import overlay_contacts  # with your other imports
-
-            contacts = [(to_body(d[0, :]), d[1, 2]) for d in GetNearestDebrisLocations(100)]
-            marked = overlay_contacts(
-                imageRGB, contacts, "top", yaw_deg=30.0, pitch_deg=-10.0, fov_deg=cameraParams.FOV
-            )
-            marked.save(
-                os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), f"cam_{imageNumber:04d}.png"
-                )
-            )
-
-        else:
-            st.OnScreenLogMessage(
-                "Failed to capture camera image :(", "CameraNoCapture", st.Severity.Info
-            )
-
-    ###################################################################################
-    # Example for getting the positions, closest points, range rates, and diameters   #
-    # of the nearest 4 pieces of debris and printing the distance to the closest one. #
-    ###################################################################################
-
-    debrisInfo = GetNearestDebrisLocations(4)
-    if len(debrisInfo) > 0:
-        closestDebris = debrisInfo[0]
-        closestDebris_loc = closestDebris[0, :]
-        closestDebris_closestPoint = closestDebris[1, 0]
-        closestDebris_rangeRate = closestDebris[1, 1]
-        closestDebris_diameter = closestDebris[1, 2]
-        st.OnScreenLogMessage(
-            f"Nearest debris: {np.linalg.norm(closestDebris_loc):.1f} m",
-            "UserAPIPrintout",
-            st.Severity.Info,
-        )
-
-    ##################################
-    # YOUR CONTROLLER CODE GOES HERE #
-    ##################################
-
-    debris = GetNearestDebrisLocations(200)
-    target_loc = target.getLocVelAcc().loc_WRT_ExprIn(phobosFrame)
-    radar_view.update(loc, debris, target_loc, iteration, to_body=to_body)
-
-    # DEBRIS TRACKING #
-    debris = GetNearestDebrisLocations(50)
-    tracks = tracker.update(loc, vel, debris)  # loc, vel: shuttle state in the Phobos frame
-    snap = tracker.snapshot(t_from_start, loc, vel)
-
-    for tr in tracks:
-        p_rel, v_rel = tracker.relative_state(tr, loc, vel)
-
-    ##################
-
-    # locVelAcc = shuttle.getLocVelAcc()
-    # loc = locVelAcc.loc_WRT_ExprIn(phobosFrame)
-    # vel = locVelAcc.vel_WRT_ExprIn(phobosFrame)
-    # rot = shuttle.getRotation().Quat_WRT(phobosFrame)
-    # angvel = shuttle.getAngVelocity().WRT_ExprIn(phobosFrame)
-    #
-    # st.OnScreenLogMessage(f"Rotation: {rot}", "UserAPIPrintout", st.Severity.Info)
-    # st.OnScreenLogMessage(f"Velocity: {vel}", "UserAPIPrintout", st.Severity.Info)
-    # linearAcceleration_m_s2 = np.zeros(3)
-    # angularAcceleration_rad_s2 = np.zeros(3)
-    # if vel[0] < 13 :
-    #
-    #    linearAcceleration_m_s2[0] = 5
-    #
-    ##if rot[1] > -np.pi/4 :
-    ##    angularAcceleration_rad_s2[1] = -0.5
-    ##elif rot[1] > -np.pi/2 :
-    ##    angularAcceleration_rad_s2[1] = 0.49999
-    ##elif rot[1] < -np.pi/2 :
-    ##    angularAcceleration_rad_s2[1] = 0
-    ## Send acceleration and angular acceleration commands
-    # SetCommand(linearAcceleration_m_s2, angularAcceleration_rad_s2)
-
-    ####################################################
-    # Example for commanding a beeline acceleration    #
-    # toward the target (and facing it the entire way) #
-    ####################################################
-
-    # Gains
-    accel_gain: float = 5  # 1.0
-    angvel_gain: float = 0.2  # 0.2
-    kp_pitch = 2.0
-    kp_yaw = 2.0
-    kp_roll = 2.0
-
-    # Translational control
     targetState: st.frames.FramedLocVelAcc = target.getLocVelAcc()
     targetLoc: npt.NDArray = targetState.loc_WRT_ExprIn(phobosFrame)
     targetVel: npt.NDArray = targetState.vel_WRT_ExprIn(phobosFrame)
 
+    ##############################
+    # Calculate desired vecocity #
+    ##############################
+
     goalDirection: npt.NDArray = (targetLoc - loc) / np.linalg.norm(targetLoc - loc)
-    goalSpeed_m_s: float = 17.0  # just keep accelerating
+    goalSpeed_m_s: float = 17.0
     goalVelocity: npt.NDArray = goalSpeed_m_s * goalDirection
 
-    v_des = goalVelocity
-    v_safe = avoider.pick(v_des, snap, vel)  # note: vel is now an argument
-    linearAcceleration_m_s2 = governor.accel(v_safe, vel)
-    linearAcceleration_m_s2 = st.frames.FramedVector(linearAcceleration_m_s2, phobosFrame).ExprIn(
-        shuttleFrame
-    )
+    ####################################################################
+    # Update tracker module with RF data and calculate a safe velocity #
+    ####################################################################
 
-    # Rotational control
-    # Align shuttle x-axis to target and shuttle y-axis to Phobos y-axis
-    x_hat = copy.deepcopy(goalDirection)
-    y_hat = np.array([0.0, -1.0, 0.0])
-    z_hat = np.cross(x_hat, y_hat)
-    z_hat = z_hat / np.linalg.norm(z_hat)
-    T_shuttlePhobos = np.vstack((x_hat, y_hat, z_hat))
-    q_shuttlePhobos = st.math.DCM_to_Quat(T_shuttlePhobos)
+    tracker.update(GetNearestDebrisLocations(50), loc, t_from_start)
+    safe_velocity = avoider.choose(goalVelocity, tracker.rocks, loc, t_from_start)
+    accel = governor.acceleration(safe_velocity, vel)                # Phobos frame
+    accel = st.frames.FramedVector(accel, phobosFrame).ExprIn(shuttleFrame)
 
-    desired_AngVel = np.zeros(3)
-    if angvel_gain != 0.0:
-        desired_AngVel = AngVelFromQuats(rot, q_shuttlePhobos, 1.0 / angvel_gain)
-    desired_AngVel = (
-        st.frames.FramedAngVel(desired_AngVel, phobosFrame).WRT(phobosFrame).ExprIn(shuttleFrame)
-    )
+    angularAcceleration_rad_s2 =  np.array([0,0,0]) # no rotation at the moment
+    #accel= np.array([0,0,10000])
+    SetCommand(accel, angularAcceleration_rad_s2) # forward desired accelerations to the sim shuttle
 
-    desired_AngVel_x = desired_AngVel[0]
-    desired_AngVel_y = desired_AngVel[1]
-    desired_AngVel_z = desired_AngVel[2]
-
-    # get current angular velocity values
-    current_AngVel = shuttle.getAngVelocity().WRT(phobosFrame).ExprIn(shuttleFrame)
-    current_AngVel_x: float = current_AngVel[0]
-    current_AngVel_y: float = current_AngVel[1]
-    current_AngVel_z: float = current_AngVel[2]
-
-    # calculate angular velocity error
-    AngVel_error_x = desired_AngVel_x - current_AngVel_x
-    AngVel_error_y = desired_AngVel_y - current_AngVel_y
-    AngVel_error_z = desired_AngVel_z - current_AngVel_z
-
-    # if AngVel_error_x > 0.1 or AngVel_error_y > 0.1 or AngVel_error_z > 0.1 :
-
-    strength_torque = shuttle.GetParam(st.VarType.double, ["Thrusters", "TorqueStrength_Nm"])
-    torque_x = kp_roll * AngVel_error_x * strength_torque
-    torque_y = kp_pitch * AngVel_error_y * strength_torque
-    torque_z = kp_yaw * AngVel_error_z * strength_torque
-
-    torque_Nm = np.array([torque_x, torque_y, torque_z])
-    angularAcceleration_rad_s2 = np.array(
-        [0, 0, 0]
-    )  # np.linalg.inv(shuttle.getInertiaTensor(shuttleFrame)) @ torque_Nm  #
-    # Send acceleration and angular acceleration commands
-    SetCommand(linearAcceleration_m_s2, angularAcceleration_rad_s2)
-
-    debris = GetNearestDebrisLocations(5)
-    if debris:
-        P = np.array([d[0, :] for d in debris])  # (N,3) centres relative to shuttle, Phobos axes
-        rc = np.array([d[1, 0] for d in debris])  # closest-surface range
-        vr = np.array([d[1, 1] for d in debris])  # range rate (negative = closing)
-        D = np.array([d[1, 2] for d in debris])  # diameters
-        ts = np.array([d[2, 0] for d in debris])  # measurement times
-        age = t_from_start - ts
-        closing = vr < 0
-
-    if iteration % 2 == 0:
-        dist = np.linalg.norm(target_loc - loc)
-        closest = debris[0][1, 0] if len(debris) else float("nan")
-        status(
-            f"t={t_from_start:6.1f}s  dist={dist:7.1f}m  speed={np.linalg.norm(vel):5.2f}m/s  "
-            f"nearest={closest:6.1f}m  damage={damage:.2f}  fuel={fuelUsed:.1f}  "
-            f"velocity={vel}"
-            f"avoid={avoider.last_info}"
-        )
+    st.OnScreenLogMessage(f"Current Velocity: {np.linalg.norm(vel)}\nDesired Velocity: {safe_velocity}\nFuel Used: {fuelUsed} kg", "Velocity", st.Severity.Info)
 
     iteration += 1
 
